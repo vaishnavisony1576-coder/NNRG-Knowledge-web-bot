@@ -13,6 +13,19 @@ from services.context_service import filter_and_rank_chunks
 
 app = FastAPI(title="NNRG RAG Backend")
 
+# Conversational memory state
+CHAT_HISTORY = []
+
+
+def get_contextual_prompt(prompt: str) -> str:
+    """Concatenates recent conversational context to the current prompt to resolve follow-ups."""
+    if CHAT_HISTORY:
+        last_turns = []
+        for msg in CHAT_HISTORY[-2:]:
+            last_turns.append(msg["content"])
+        return " ".join(last_turns) + " " + prompt
+    return prompt
+
 # Enable CORS for frontend interaction
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +77,8 @@ def is_query_related_local(prompt: str) -> bool:
         "admissions", "admission", "placement", "placements", "hostel", "transport", "bus", "buses", "route", "routes",
         "canteen", "library", "fees", "fee", "principal", "chairman", "campus", "course", "courses", "syllabus", "curriculum",
         "b.tech", "btech", "pharmacy", "b.pharm", "bpharm", "mba", "m.tech", "mtech", "m.pharm", "mpharm",
-        "pdf", "document", "file", "uploaded", "prospectus", "brochure", "enquiry", "college", "institutions", "institution"
+        "pdf", "document", "file", "uploaded", "prospectus", "brochure", "enquiry", "college", "institutions", "institution",
+        "aiml", "vaishnavi", "specialization", "better", "choose", "why"
     }
     
     for white in nnrg_keywords:
@@ -145,8 +159,10 @@ def home():
 
 @app.get("/chat")
 def chat(prompt: str, mode: str = "general"):
-    # Pre-Gemini validation check for query relevance
-    if not is_query_related(prompt):
+    contextual_prompt = get_contextual_prompt(prompt)
+
+    # Pre-Gemini validation check for query relevance using contextual prompt
+    if not is_query_related(contextual_prompt):
         return {"response": (
             "Sorry, I can only answer questions related to:\n"
             "• NNRG Group of Institutions\n"
@@ -163,14 +179,14 @@ def chat(prompt: str, mode: str = "general"):
             db = get_vector_store()
             res = db.get(limit=1)
             if res and res.get("ids"):
-                docs_and_scores = db.similarity_search_with_score(prompt, k=1, filter={"source": active_pdf})
+                docs_and_scores = db.similarity_search_with_score(contextual_prompt, k=1, filter={"source": active_pdf})
                 if docs_and_scores and docs_and_scores[0][1] <= 0.85:
                     pdf_has_match = True
     except Exception as e:
         print(f"Error checking PDF relevance: {e}")
 
     # Automatically select the correct knowledge source based on the user's query
-    detected_intent = detect_intent(prompt)
+    detected_intent = detect_intent(contextual_prompt)
     if detected_intent in ["pdf", "website"]:
         chosen_mode = detected_intent
     elif pdf_has_match:
@@ -181,11 +197,11 @@ def chat(prompt: str, mode: str = "general"):
         chosen_mode = "general"
 
     if chosen_mode == "pdf":
-        pdf_content = search_pdf(prompt)
+        pdf_content = search_pdf(contextual_prompt)
         if "No PDF documents have been uploaded" in pdf_content:
             answer = "📄 PDF mode is active, but no documents have been uploaded yet. Please upload PDF files first at http://127.0.0.1:8000/upload-gui"
         else:
-            pdf_content = filter_and_rank_chunks(pdf_content, prompt, "pdf")
+            pdf_content = filter_and_rank_chunks(pdf_content, contextual_prompt, "pdf")
             if "Sorry, I couldn't find that information" in pdf_content:
                 answer = pdf_content
             else:
@@ -199,14 +215,15 @@ PDF Information:
 
 Question:
 {prompt}
-"""
+""",
+                    history=CHAT_HISTORY
                 )
     elif chosen_mode == "website":
-        website_content = search_website(prompt)
+        website_content = search_website(contextual_prompt)
         if "Website data not found" in website_content:
             answer = "🌐 Website RAG mode is active, but no website data was found. Please scrape the website first at http://127.0.0.1:8000/scrape"
         else:
-            website_content = filter_and_rank_chunks(website_content, prompt, "website")
+            website_content = filter_and_rank_chunks(website_content, contextual_prompt, "website")
             if "Sorry, I couldn't find that information" in website_content:
                 answer = website_content
             else:
@@ -220,10 +237,15 @@ Website Information:
 
 Question:
 {prompt}
-"""
+""",
+                    history=CHAT_HISTORY
                 )
     else:
-        answer = get_response(prompt)
+        answer = get_response(prompt, history=CHAT_HISTORY)
+
+    # Record the conversation turn
+    CHAT_HISTORY.append({"role": "user", "content": prompt})
+    CHAT_HISTORY.append({"role": "model", "content": answer})
 
     return {"response": answer}
 
@@ -250,6 +272,7 @@ def upload_pdf(file: UploadFile = File(...)):
         # Trigger indexing sync in ChromaDB
         sync_msg = sync_pdf_index()
         set_active_pdf(file.filename)
+        CHAT_HISTORY.clear()
         return {
             "message": f"Successfully uploaded and indexed '{file.filename}'.",
             "sync_status": sync_msg
@@ -286,6 +309,7 @@ def delete_file(filename: str):
         os.remove(file_path)
         # Update the index to remove references to the deleted file from Chroma DB
         sync_msg = sync_pdf_index()
+        CHAT_HISTORY.clear()
         return {
             "message": f"Successfully deleted '{filename}' from server.",
             "sync_status": sync_msg

@@ -80,7 +80,7 @@ function ChatWidget() {
       ...prev,
       {
         sender: "bot",
-        text: "📄 Uploading your PDF...\n🔍 Processing document...\n🧠 Creating embeddings...",
+        text: `📄 Uploading:\n${file.name}\n\n🔍 Processing document...\n\n🧠 Creating embeddings...`,
       },
     ]);
 
@@ -99,7 +99,7 @@ function ChatWidget() {
           ...prev,
           {
             sender: "bot",
-            text: "✅ PDF indexed successfully! Ask me anything about this document.",
+            text: `✅ PDF indexed successfully.\n\nCurrent Active Document:\n📄 ${file.name}\n\nAsk me anything about this document.`,
           },
         ]);
         setMode("pdf");

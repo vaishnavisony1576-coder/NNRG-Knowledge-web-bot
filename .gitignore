@@ -1,0 +1,71 @@
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment Variables
+.env
+
+# ==========================
+# FastAPI / Logs
+# ==========================
+*.log
+*.sqlite3
+
+# ==========================
+# Vector Database / Uploaded Files
+# ==========================
+chroma_db/
+db/
+vector_db/
+uploads/
+*.faiss
+*.pkl
+
+# ==========================
+# Node
+# ==========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==========================
+# Vite
+# ==========================
+dist/
+.vite/
+
+# ==========================
+# VS Code
+# ==========================
+.vscode/
+
+# ==========================
+# OS Files
+# ==========================
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Cache
+# ==========================
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# ==========================
+# Coverage
+# ==========================
+coverage/
+htmlcov/

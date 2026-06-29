@@ -45,6 +45,16 @@ def clean_soup(soup):
     return soup
 
 
+def normalize_text_for_matching(text):
+    """Normalizes AI/ML abbreviation variations so they match synonymously."""
+    text = text.lower()
+    text = re.sub(r'\bai\s*&\s*ml\b', 'aiml', text)
+    text = re.sub(r'\bai\s*and\s*ml\b', 'aiml', text)
+    text = re.sub(r'ai&ml', 'aiml', text)
+    text = re.sub(r'ai-ml', 'aiml', text)
+    return text
+
+
 def extract_keywords(query):
     """Extracts meaningful keywords from the query for post-filtering and reranking."""
     stopwords = {
@@ -54,9 +64,10 @@ def extract_keywords(query):
         'or', 'but', 'if', 'any', 'some', 'all', 'anywhere', 'anyone', 'anything', 'please', 'tell',
         'show', 'find', 'get', 'list', 'give'
     }
-    # Clean the query, convert to lowercase, and split
+    # Normalize query first
+    query_norm = normalize_text_for_matching(query)
     words = []
-    cleaned_query = "".join(char if char.isalnum() or char.isspace() else " " for char in query.lower())
+    cleaned_query = "".join(char if char.isalnum() or char.isspace() else " " for char in query_norm)
     for word in cleaned_query.split():
         if word not in stopwords and len(word) > 2:
             words.append(word)
@@ -65,7 +76,7 @@ def extract_keywords(query):
 
 def score_document(doc, keywords):
     """Calculates keyword match relevance score for a document."""
-    text = doc.page_content.lower()
+    text = normalize_text_for_matching(doc.page_content)
     score = 0
     for kw in keywords:
         if kw in text:
@@ -158,31 +169,119 @@ def scrape_website():
         return f"Error scraping website: {str(e)}"
 
 
-def search_website(question, top_k=5):
+def search_website_fallback(question):
     """
-    Performs vector similarity search on the Website Chroma collection.
-    Automatically indexes raw website text if the collection is empty.
-    Reranks and filters matches using semantic similarity and keyword scores.
+    Fallback keyword search over nnrg_website.txt if Chroma database is empty, rate-limited, or fails.
     """
     try:
-        db = get_website_store()
-        res = db.get(limit=1)
+        data_dir = os.path.dirname(CHROMA_WEBSITE_PATH)
+        txt_path = os.path.join(data_dir, "nnrg_website.txt")
+        if not os.path.exists(txt_path):
+            return "Sorry, I couldn't find that information in the available knowledge base."
+            
+        with open(txt_path, "r", encoding="utf-8") as f:
+            text = f.read()
+            
+        # Parse page blocks using the regex delimiter
+        page_blocks = re.split(r'=== NNRG Website Page: (.*?) \((.*?)\) ===', text)
+        candidates = []
         
-        # Auto-index raw file if vector store is empty but raw backup exists
-        if not res or not res.get("ids"):
+        # Clean query and extract keywords
+        stopwords = {
+            'what', 'is', 'are', 'the', 'of', 'in', 'to', 'for', 'a', 'an', 'on', 'from', 'with', 'by', 
+            'about', 'how', 'do', 'does', 'can', 'you', 'i', 'we', 'they', 'he', 'she', 'it', 'me', 'us', 
+            'them', 'who', 'where', 'when', 'why', 'which', 'there', 'their', 'our', 'your', 'my', 'and', 
+            'or', 'but', 'if', 'any', 'some', 'all', 'please', 'tell', 'show', 'find', 'get', 'list', 'give'
+        }
+        words = []
+        # Normalize question first
+        question_norm = normalize_text_for_matching(question)
+        cleaned_query = "".join(char if char.isalnum() or char.isspace() else " " for char in question_norm)
+        for word in cleaned_query.split():
+            if word not in stopwords and len(word) > 2:
+                words.append(word)
+                
+        i = 1
+        while i < len(page_blocks):
+            name = page_blocks[i].strip()
+            url = page_blocks[i+1].strip()
+            content = page_blocks[i+2].strip()
+            
+            name_lower = name.lower()
+            question_lower = question.lower()
+            
+            # Split page content into paragraphs
+            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+            for p in paragraphs:
+                p_norm = normalize_text_for_matching(p)
+                matches = sum(1 for kw in words if kw in p_norm)
+                if matches > 0:
+                    score = matches
+                    
+                    # Boost specific sections matching exact query terms
+                    if any(kw in question_lower for kw in ["placement", "recruit", "job", "career"]):
+                        if "placement" in name_lower:
+                            score += 15
+                    if any(kw in question_lower for kw in ["admission", "apply", "join", "eligibility", "counseling"]):
+                        if "admission" in name_lower or "fee" in name_lower:
+                            score += 15
+                    if any(kw in question_lower for kw in ["location", "contact", "address", "where is", "phone", "email", "located"]):
+                        if "contact" in name_lower:
+                            score += 15
+                        
+                    candidates.append((p, score, name, url))
+            i += 3
+            
+        if not candidates:
+            return "Sorry, I couldn't find that information in the available knowledge base."
+            
+        # Sort by score descending
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take top 4 candidates and format them
+        top_candidates = candidates[:4]
+        formatted_chunks = []
+        for p, score, name, url in top_candidates:
+            formatted_chunks.append(f"Page: {name}\nContent: {p}")
+            
+        return "\n\n".join(formatted_chunks)
+    except Exception as e:
+        print(f"Error in search_website_fallback: {e}")
+        return "Sorry, I couldn't find that information in the available knowledge base."
+
+
+def search_website(question, top_k=5):
+    """
+    Performs hybrid vector + keyword search on the Website Chroma collection and local text backup.
+    Reranks and filters matches using semantic similarity, synonym mapping, and page boosts.
+    """
+    try:
+        candidates = []
+        
+        # 1. Try retrieving candidates from vector store
+        db_docs = []
+        try:
+            db = get_website_store()
+            res = db.get(limit=1)
+            if res and res.get("ids"):
+                docs_and_scores = db.similarity_search_with_score(question, k=10)
+                if docs_and_scores:
+                    for doc, distance in docs_and_scores:
+                        # Convert L2 distance to similarity score
+                        similarity = 1.0 - (distance / 2.0)
+                        db_docs.append((doc, similarity))
+        except Exception as e:
+            print(f"Chroma retrieval failed: {e}. Relying on text search.")
+            
+        # 2. Retrieve candidates from local text fallback
+        fallback_docs = []
+        try:
             data_dir = os.path.dirname(CHROMA_WEBSITE_PATH)
             txt_path = os.path.join(data_dir, "nnrg_website.txt")
             if os.path.exists(txt_path):
-                print("Website Chroma empty. Building index from local nnrg_website.txt...")
                 with open(txt_path, "r", encoding="utf-8") as f:
                     text = f.read()
-                
                 page_blocks = re.split(r'=== NNRG Website Page: (.*?) \((.*?)\) ===', text)
-                docs = []
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=800,
-                    chunk_overlap=150
-                )
                 
                 i = 1
                 while i < len(page_blocks):
@@ -190,62 +289,80 @@ def search_website(question, top_k=5):
                     url = page_blocks[i+1].strip()
                     content = page_blocks[i+2].strip()
                     
-                    cleaned_lines = [line.strip() for line in content.split("\n") if line.strip()]
-                    clean_content = "\n".join(cleaned_lines)
-                    
-                    page_chunks = text_splitter.split_text(clean_content)
-                    for chunk in page_chunks:
-                        chunk_content = f"Page: {name}\nContent: {chunk}"
-                        docs.append(Document(
-                            page_content=chunk_content,
+                    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+                    for p in paragraphs:
+                        fallback_docs.append(Document(
+                            page_content=f"Page: {name}\nContent: {p}",
                             metadata={"source": name, "url": url}
                         ))
                     i += 3
-                
-                if docs:
-                    db.add_documents(docs)
-            else:
-                # Crawl from scratch
-                print("Website index and local text missing. Crawling nnrg.edu.in...")
-                scrape_website()
-                db = get_website_store()
-                
-        # 1. Retrieve a wider set of candidates
-        docs_and_scores = db.similarity_search_with_score(question, k=15)
-        if not docs_and_scores:
-            return "Sorry, I couldn't find that information on the NNRG website."
-            
-        # 2. Extract keywords from user question
+        except Exception as e:
+            print(f"Fallback reading failed: {e}")
+
+        # 3. Extract keywords (synonym normalized)
         keywords = extract_keywords(question)
+        question_lower = question.lower()
         
-        # 3. Score and filter candidates
-        valid_candidates = []
-        for doc, distance in docs_and_scores:
-            similarity = 1.0 - (distance / 2.0)
-            kw_score = score_document(doc, keywords)
-            total_score = similarity + (kw_score * 0.1)
-            
-            # Filter completely unrelated pages: high distance and no keyword matches
-            if distance > 0.95 and kw_score == 0:
+        # 4. Score and merge all candidates
+        scored_candidates = []
+        seen_contents = set()
+        
+        # Process database docs first
+        for doc, similarity in db_docs:
+            content_clean = doc.page_content.strip()
+            if content_clean in seen_contents:
                 continue
+            seen_contents.add(content_clean)
+            
+            kw_score = score_document(doc, keywords)
+            total_score = similarity + (kw_score * 0.25)
+            
+            # Apply page topic boosts
+            name = doc.metadata.get("source", "").lower()
+            if any(kw in question_lower for kw in ["placement", "recruit", "job", "career"]) and "placement" in name:
+                total_score += 15
+            if any(kw in question_lower for kw in ["admission", "apply", "join", "eligibility", "counseling"]) and ("admission" in name or "fee" in name):
+                total_score += 15
+            if any(kw in question_lower for kw in ["location", "contact", "address", "where is", "phone", "email", "located"]) and "contact" in name:
+                total_score += 15
                 
-            valid_candidates.append((doc, total_score, distance, kw_score))
+            scored_candidates.append((doc, total_score))
             
-        # 4. Sort candidates by total score descending
-        valid_candidates.sort(key=lambda x: x[1], reverse=True)
+        # Process fallback docs
+        for doc in fallback_docs:
+            content_clean = doc.page_content.strip()
+            if content_clean in seen_contents:
+                continue
+            seen_contents.add(content_clean)
+            
+            kw_score = score_document(doc, keywords)
+            if kw_score > 0:
+                # Default baseline similarity for matched text
+                similarity = 0.5
+                total_score = similarity + (kw_score * 0.25)
+                
+                # Apply page topic boosts
+                name = doc.metadata.get("source", "").lower()
+                if any(kw in question_lower for kw in ["placement", "recruit", "job", "career"]) and "placement" in name:
+                    total_score += 15
+                if any(kw in question_lower for kw in ["admission", "apply", "join", "eligibility", "counseling"]) and ("admission" in name or "fee" in name):
+                    total_score += 15
+                if any(kw in question_lower for kw in ["location", "contact", "address", "where is", "phone", "email", "located"]) and "contact" in name:
+                    total_score += 15
+                    
+                scored_candidates.append((doc, total_score))
+                
+        # 5. Sort candidates by total score descending
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
         
-        # 5. Return the top 3-5 most relevant chunks (we select top 4)
-        final_candidates = valid_candidates[:4]
-        
-        if not final_candidates:
-            return "Sorry, I couldn't find that information on the NNRG website."
+        # 6. Return top 4 candidates
+        top_candidates = scored_candidates[:4]
+        if not top_candidates:
+            return "Sorry, I couldn't find that information in the available knowledge base."
             
-        # Strict verification for unrelated topics
-        if final_candidates[0][2] > 0.95 and final_candidates[0][3] == 0:
-            return "Sorry, I couldn't find that information on the NNRG website."
-            
-        results = [doc.page_content for doc, _, _, _ in final_candidates]
+        results = [doc.page_content for doc, _ in top_candidates]
         return "\n\n".join(results)
         
     except Exception as e:
-        return f"Website data not found. Please run /scrape first. Error: {str(e)}"
+        print(f"Unexpected error in search_website: {e}")
+        return "Sorry, I couldn't find that information in the available knowledge base."

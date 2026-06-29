@@ -15,15 +15,15 @@ app = FastAPI(title="NNRG RAG Backend")
 
 # Conversational memory state
 CHAT_HISTORY = []
+PREVIOUS_RAG_MODE = "general"
 
 
 def get_contextual_prompt(prompt: str) -> str:
-    """Concatenates recent conversational context to the current prompt to resolve follow-ups."""
+    """Concatenates the previous user question to the current prompt to keep context highly focused."""
     if CHAT_HISTORY:
-        last_turns = []
-        for msg in CHAT_HISTORY[-2:]:
-            last_turns.append(msg["content"])
-        return " ".join(last_turns) + " " + prompt
+        for entry in reversed(CHAT_HISTORY):
+            if entry["role"] == "user":
+                return entry["content"] + " " + prompt
     return prompt
 
 # Enable CORS for frontend interaction
@@ -109,7 +109,7 @@ def is_query_related(prompt: str) -> bool:
                 # Search the PDF store for relevant matches filtering by active PDF
                 docs_and_scores = db.similarity_search_with_score(prompt, k=3, filter={"source": active_pdf})
                 for doc, score in docs_and_scores:
-                    if score <= 0.85:
+                    if score <= 0.80:
                         return True
     except Exception as e:
         print(f"Error checking PDF db relatedness: {e}")
@@ -123,7 +123,7 @@ def is_query_related(prompt: str) -> bool:
             # Search the website store for relevant matches
             docs_and_scores_web = db_web.similarity_search_with_score(prompt, k=3)
             for doc, score in docs_and_scores_web:
-                if score <= 0.85:
+                if score <= 0.80:
                     return True
     except Exception as e:
         print(f"Error checking website db relatedness: {e}")
@@ -163,14 +163,9 @@ def chat(prompt: str, mode: str = "general"):
 
     # Pre-Gemini validation check for query relevance using contextual prompt
     if not is_query_related(contextual_prompt):
-        return {"response": (
-            "Sorry, I can only answer questions related to:\n"
-            "• NNRG Group of Institutions\n"
-            "• Uploaded PDF documents\n\n"
-            "Please ask a question related to these topics."
-        )}
+        return {"response": "Sorry, I can only answer questions related to NNRG Group of Institutions or the currently uploaded PDF document."}
         
-    # Check if query matches the PDF database with high confidence to trigger automatic routing
+    # Check if query matches the PDF database with high confidence to trigger automatic routing (evaluate on contextual prompt)
     pdf_has_match = False
     try:
         from services.pdf_service import get_vector_store, UPLOADS_DIR
@@ -185,16 +180,23 @@ def chat(prompt: str, mode: str = "general"):
     except Exception as e:
         print(f"Error checking PDF relevance: {e}")
 
-    # Automatically select the correct knowledge source based on the user's query
+    # Automatically select the correct knowledge source based on the user's query (detect on contextual prompt)
     detected_intent = detect_intent(contextual_prompt)
+    
+    global PREVIOUS_RAG_MODE
     if detected_intent in ["pdf", "website"]:
         chosen_mode = detected_intent
     elif pdf_has_match:
         chosen_mode = "pdf"
     elif mode in ["pdf", "website"]:
         chosen_mode = mode
+    elif PREVIOUS_RAG_MODE in ["pdf", "website"]:
+        # Inherit previous mode for conversational follow-ups
+        chosen_mode = PREVIOUS_RAG_MODE
     else:
         chosen_mode = "general"
+
+    PREVIOUS_RAG_MODE = chosen_mode
 
     if chosen_mode == "pdf":
         pdf_content = search_pdf(contextual_prompt)
@@ -273,6 +275,8 @@ def upload_pdf(file: UploadFile = File(...)):
         sync_msg = sync_pdf_index()
         set_active_pdf(file.filename)
         CHAT_HISTORY.clear()
+        global PREVIOUS_RAG_MODE
+        PREVIOUS_RAG_MODE = "general"
         return {
             "message": f"Successfully uploaded and indexed '{file.filename}'.",
             "sync_status": sync_msg
@@ -310,6 +314,8 @@ def delete_file(filename: str):
         # Update the index to remove references to the deleted file from Chroma DB
         sync_msg = sync_pdf_index()
         CHAT_HISTORY.clear()
+        global PREVIOUS_RAG_MODE
+        PREVIOUS_RAG_MODE = "general"
         return {
             "message": f"Successfully deleted '{filename}' from server.",
             "sync_status": sync_msg

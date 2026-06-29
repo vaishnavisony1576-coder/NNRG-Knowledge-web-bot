@@ -205,6 +205,66 @@ def sync_pdf_index(force=False):
     return "PDF vector index is up to date."
 
 
+def search_pdf_fallback(question):
+    """
+    Fallback keyword search over the raw PDF file if Chroma DB fails.
+    """
+    try:
+        active_pdf = get_active_pdf()
+        if not active_pdf:
+            return "No PDF documents have been uploaded yet."
+            
+        filepath = os.path.join(UPLOADS_DIR, active_pdf)
+        if not os.path.exists(filepath):
+            return "Active PDF file not found on server."
+            
+        pages = extract_text_from_pdf(filepath)
+        if not pages:
+            return "Failed to extract text from the active PDF."
+            
+        # Extract keywords
+        stopwords = {
+            'what', 'is', 'are', 'the', 'of', 'in', 'to', 'for', 'a', 'an', 'on', 'from', 'with', 'by', 
+            'about', 'how', 'do', 'does', 'can', 'you', 'i', 'we', 'they', 'he', 'she', 'it', 'me', 'us', 
+            'them', 'who', 'where', 'when', 'why', 'which', 'there', 'their', 'our', 'your', 'my', 'and', 
+            'or', 'but', 'if', 'any', 'some', 'all', 'please', 'tell', 'show', 'find', 'get', 'list', 'give'
+        }
+        words = []
+        cleaned_query = "".join(char if char.isalnum() or char.isspace() else " " for char in question.lower())
+        for word in cleaned_query.split():
+            if word not in stopwords and len(word) > 2:
+                words.append(word)
+                
+        candidates = []
+        for page in pages:
+            text = page["text"]
+            # Split page text into smaller paragraph blocks
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+            for p in paragraphs:
+                p_lower = p.lower()
+                matches = sum(1 for kw in words if kw in p_lower)
+                if matches > 0:
+                    candidates.append((p, matches, page["page_num"]))
+                    
+        if not candidates:
+            # Fallback to returning first few pages if no keyword match
+            first_chunks = []
+            for page in pages[:3]:
+                first_chunks.append(f"Page: {page['page_num']}\nContent: {page['text'][:500]}")
+            return "\n\n".join(first_chunks)
+            
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = candidates[:4]
+        formatted_chunks = []
+        for p, score, page_num in top_candidates:
+            formatted_chunks.append(f"Page: {page_num}\nContent: {p}")
+            
+        return "\n\n".join(formatted_chunks)
+    except Exception as e:
+        print(f"Error in search_pdf_fallback: {e}")
+        return "Sorry, I couldn't find that information in the uploaded PDF."
+
+
 def search_pdf(question, top_k=5):
     """
     Performs vector similarity search on the PDF Chroma collection.
@@ -215,17 +275,26 @@ def search_pdf(question, top_k=5):
     if not active_pdf:
         return "No PDF documents have been uploaded yet. Please upload PDF files to search them."
 
-    db = get_vector_store()
-    
     try:
-        # If collection is empty, trigger a sync
-        res = db.get(limit=1)
-        if not res or not res.get("ids"):
-            sync_pdf_index()
+        try:
             db = get_vector_store()
             res = db.get(limit=1)
+        except Exception as e:
+            print(f"Chroma get failed: {e}. Falling back to PDF text file search.")
+            return search_pdf_fallback(question)
+        
+        # If collection is empty, trigger a sync
+        if not res or not res.get("ids"):
+            try:
+                sync_pdf_index()
+                db = get_vector_store()
+                res = db.get(limit=1)
+            except Exception as e:
+                print(f"Chroma sync failed: {e}. Falling back to PDF text file search.")
+                return search_pdf_fallback(question)
+                
             if not res or not res.get("ids"):
-                return "No PDF documents indexed yet. Please upload PDF files."
+                return search_pdf_fallback(question)
 
         question_lower = question.lower().strip()
 
@@ -237,11 +306,11 @@ def search_pdf(question, top_k=5):
                 for doc_text, meta in zip(all_result["documents"], all_result["metadatas"]):
                     all_docs.append(Document(page_content=doc_text, metadata=meta))
         except Exception as e:
-            print(f"Error getting all PDF docs: {e}")
-            all_docs = []
+            print(f"Error getting all PDF docs: {e}. Falling back to PDF text search.")
+            return search_pdf_fallback(question)
 
         if not all_docs:
-            return "No relevant information matching the question was found in the PDFs."
+            return search_pdf_fallback(question)
 
         # Sort all documents by page number to represent original document flow
         all_docs.sort(key=lambda d: d.metadata.get("page", 1))
@@ -290,7 +359,11 @@ def search_pdf(question, top_k=5):
 
         # Fallback: standard similarity search
         if not selected_docs:
-            selected_docs = db.similarity_search(question, k=top_k, filter={"source": active_pdf})
+            try:
+                selected_docs = db.similarity_search(question, k=top_k, filter={"source": active_pdf})
+            except Exception as e:
+                print(f"Similarity search failed in search_pdf: {e}. Falling back to PDF text search.")
+                return search_pdf_fallback(question)
 
         results = []
         for doc in selected_docs:
@@ -303,5 +376,5 @@ def search_pdf(question, top_k=5):
         return "\n\n".join(results)
         
     except Exception as e:
-        print(f"Error in similarity search: {e}")
-        return f"Error querying PDF vector store: {str(e)}"
+        print(f"Error in search_pdf: {e}")
+        return search_pdf_fallback(question)

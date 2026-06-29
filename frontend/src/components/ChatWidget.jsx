@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { FaRobot, FaTimes, FaPaperPlane, FaPlus } from "react-icons/fa";
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+const BACKEND_URL = `https://nnrg-knowledge-web-bot.onrender.com`;
 
 function ChatWidget() {
   const [open, setOpen] = useState(false);

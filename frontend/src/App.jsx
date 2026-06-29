@@ -8,8 +8,9 @@ function App() {
     <>
       <Navbar />
       <Home />
-      <ChatWidget />
       <Footer />
+      
+      <ChatWidget />
     </>
   );
 }
